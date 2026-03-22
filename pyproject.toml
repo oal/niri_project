@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "niri-project"
+version = "0.1.0"
+description = "CLI tool for managing project workspaces in the Niri Wayland compositor"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.scripts]
+niri-project = "niri_project.cli:main"
