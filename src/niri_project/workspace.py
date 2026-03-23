@@ -23,64 +23,29 @@ def _match_window(window: dict, app: AppConfig) -> bool:
     return True
 
 
-def _wait_for_windows(
-    config: ProjectConfig, known_ids: set[int], verbose: bool = False
-) -> dict[int, int]:
-    """Wait for windows matching each app config to appear.
-
-    Returns mapping of app index -> window_id.
-    """
-    matched: dict[int, int] = {}
-    max_timeout = max(app.timeout for app in config.apps) + 5
-    deadline = time.monotonic() + max_timeout
-
-    # Use event stream for efficiency
-    proc = niri.event_stream()
+def _try_match_windows(
+    config: ProjectConfig, known_ids: set[int], matched: dict[int, int],
+    verbose: bool = False,
+) -> None:
+    """Check current windows for any new matches."""
     try:
-        while len(matched) < len(config.apps) and time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
+        current_windows = niri.get_windows()
+    except niri.NiriError:
+        return
+
+    for window in current_windows:
+        wid = window["id"]
+        if wid in known_ids or wid in matched.values():
+            continue
+        for i, app in enumerate(config.apps):
+            if i in matched:
+                continue
+            if _match_window(window, app):
+                matched[i] = wid
+                if verbose:
+                    print(f"  Matched window {wid} ({window.get('app_id')}) -> {app.match_app_id}")
                 break
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
-            # Check for window-open events
-            if "WindowsChanged" not in event and "WindowOpenedOrChanged" not in event:
-                continue
-
-            # Query current windows to find new ones
-            try:
-                current_windows = niri.get_windows()
-            except niri.NiriError:
-                continue
-
-            for window in current_windows:
-                wid = window["id"]
-                if wid in known_ids or wid in matched.values():
-                    continue
-                for i, app in enumerate(config.apps):
-                    if i in matched:
-                        continue
-                    if _match_window(window, app):
-                        matched[i] = wid
-                        if verbose:
-                            print(f"  Matched window {wid} ({window.get('app_id')}) -> {app.match_app_id}")
-                        break
-
-            # Check per-app timeouts
-            for i, app in enumerate(config.apps):
-                if i not in matched:
-                    app_deadline = time.monotonic()  # we track from start, simplified
-                    # If we've matched all, break early
-                    pass
-
-    finally:
-        proc.terminate()
-        proc.wait()
-
-    return matched
 
 
 def _arrange_windows(config: ProjectConfig, matched: dict[int, int], verbose: bool = False) -> None:
@@ -117,32 +82,17 @@ def _arrange_windows(config: ProjectConfig, matched: dict[int, int], verbose: bo
         if verbose:
             print(f"  Grouping '{group_name}': indices {indices}")
 
-        # Focus the first window in the group
+        # Windows are already ordered by index from Step 1, so grouped windows
+        # are adjacent.  Focus the first window, then consume each neighbor.
         first_wid = matched[indices[0]]
         niri.focus_window(first_wid)
-        time.sleep(0.2)
+        time.sleep(0.15)
 
-        # For each subsequent window, move it next to the first and consume
         for idx in indices[1:]:
-            wid = matched[idx]
-            niri.focus_window(wid)
-            time.sleep(0.1)
-            # Move it right next to the group leader
-            niri.focus_window(first_wid)
-            time.sleep(0.1)
-            # The consume command pulls the right neighbor into the focused column
-            # So we need the window to be to the right of the focused one
-            niri.focus_window(wid)
-            time.sleep(0.1)
-            niri.focus_window(first_wid)
-            time.sleep(0.1)
             niri.consume_window_into_column()
-            time.sleep(0.2)
+            time.sleep(0.15)
             consumed_indices.add(idx)
 
-        # Set to tabbed display
-        niri.focus_window(first_wid)
-        time.sleep(0.1)
         niri.set_column_display("tabbed")
         time.sleep(0.1)
 
@@ -234,17 +184,47 @@ def start_project(config: ProjectConfig, verbose: bool = False) -> None:
     niri.set_workspace_name(config.name)
     time.sleep(0.1)
 
-    # Spawn all apps
+    # Spawn apps one at a time, waiting for each window before starting the next.
+    # This avoids issues with launchers (e.g. JetBrains Toolbox) that can't handle
+    # multiple simultaneous spawn requests.
     print(f"Starting project '{config.name}'...")
-    for app in config.apps:
-        if verbose:
-            print(f"  Spawning: {' '.join(app.command)}")
-        niri.spawn(app.command)
-        time.sleep(0.3)  # small delay between spawns
+    matched: dict[int, int] = {}
 
-    # Wait for windows to appear
-    print("  Waiting for windows...")
-    matched = _wait_for_windows(config, known_ids, verbose=verbose)
+    max_attempts = 3
+    for i, app in enumerate(config.apps):
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1 and verbose:
+                print(f"  Retry {attempt}/{max_attempts}: {' '.join(app.command)}")
+            elif verbose:
+                print(f"  Spawning: {' '.join(app.command)}")
+
+            event_proc = niri.event_stream()
+            niri.spawn(app.command)
+
+            # Use a short initial timeout; niri spawn failures are instant,
+            # successful apps open a window within a few seconds.
+            wait = 10 if attempt < max_attempts else app.timeout
+            deadline = time.monotonic() + wait
+            while i not in matched and time.monotonic() < deadline:
+                line = event_proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "WindowsChanged" not in event and "WindowOpenedOrChanged" not in event:
+                    continue
+                _try_match_windows(config, known_ids, matched, verbose=verbose)
+
+            event_proc.terminate()
+            event_proc.wait()
+
+            if i in matched:
+                break
+
+        if i not in matched and verbose:
+            print(f"  Warning: no window appeared for {app.match_app_id}")
 
     if len(matched) < len(config.apps):
         missing = [
