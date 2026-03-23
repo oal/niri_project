@@ -5,5 +5,5 @@ __pycache__/
 dist/
 build/
 .idea/
-.claude/
+.claude/settings.local.json
 NIRI_PROJECT_MANAGER.md
